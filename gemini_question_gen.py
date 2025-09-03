@@ -51,7 +51,55 @@ class GeminiQuestionGen:
     Ensure proper latex formatting
     """
     
-    
+    def _sanitize(self, text: str):
+        """Extract JSON from `text` and return the parsed Python object.
+
+        Strategy:
+        - First, try to find a fenced code block that starts with ```json and ends with ```.
+        - If not found, try to parse the entire text as JSON.
+        - If that fails, try to extract JSON-like content using regex for { ... }.
+        - Then, try to parse the extracted content with json.loads.
+        - On JSON decode error, attempt fallbacks (escape backslashes, or use ast.literal_eval).
+        """
+        import re
+        import json
+
+        code = None
+        # Try to find the first ```json ... ``` block
+        m = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE)
+        if m:
+            code = m.group(1).strip()
+        else:
+            # Try to parse the whole text as JSON
+            try:
+                return json.loads(text.strip())
+            except json.JSONDecodeError:
+                pass
+            # Try to extract JSON using regex for outermost { ... }
+            m2 = re.search(r'\{.*\}', text, re.DOTALL)
+            if m2:
+                code = m2.group(0).strip()
+            else:
+                raise ValueError("No JSON content found in text")
+
+        # Now parse the code
+        # Try direct JSON parse first
+        try:
+            return json.loads(code)
+        except json.JSONDecodeError:
+            # Try escaping single backslashes (common when LaTeX backslashes are present)
+            try:
+                fixed = code.replace('\\', '\\\\')
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                # Last resort: try ast.literal_eval after converting JSON literals to Python
+                import ast
+                pyish = code.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+                try:
+                    return ast.literal_eval(pyish)
+                except Exception as e:
+                    raise ValueError('Failed to parse JSON content') from e
+
 
 
     def generate(self, course="Contol Systems", topic="Laplace Transform", difficulty="medium", is_calculation = False):
@@ -69,6 +117,7 @@ class GeminiQuestionGen:
                 ],
             ),
         ]
+        
         generate_content_config = types.GenerateContentConfig(
             temperature=TEMPERATURE,
             top_p=TOP_P,
@@ -86,6 +135,7 @@ class GeminiQuestionGen:
                 for part in chunk.parts:
                     if hasattr(part, "text"):
                         response += part.text
+        response = self._sanitize(response)
         print(response)
 
 if __name__ == "__main__":
