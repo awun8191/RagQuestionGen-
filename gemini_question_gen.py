@@ -19,8 +19,7 @@ import time
 import hashlib
 from typing import Any, Dict, List, Optional, Callable, Awaitable
 
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
+from openai import OpenAI
 
 # Optional mapping to your Pydantic model
 try:
@@ -103,25 +102,18 @@ class EngineeringQuestionGen:
         top_p: float = 0.85,
         system_instruction: Optional[str] = None,
     ):
-        api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        if not api_key:
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        if not self.api_key:
             raise ValueError("No API key provided. Set GOOGLE_API_KEY or pass api_key.")
-        genai.configure(api_key=api_key)
 
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
         self.model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-
-        self._base_cfg = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            response_mime_type="application/json",
-            response_schema=QUESTION_SET_SCHEMA,
-        )
-
-        self.model = genai.GenerativeModel(
-            model_name=self.model_name,
-            system_instruction=system_instruction or self._get_engineering_system_instruction(),
-            generation_config=self._base_cfg,
-        )
+        self.temperature = temperature
+        self.top_p = top_p
+        self.system_instruction = system_instruction or self._get_engineering_system_instruction()
 
         self._cache: Dict[str, Dict[str, Any]] = {}
 
@@ -153,24 +145,25 @@ class EngineeringQuestionGen:
 
         # More tokens for detailed engineering explanations
         max_tokens = min(8192, 350 + int(300 * max(1, num_questions)))
-        cfg = GenerationConfig(
-            temperature=self._base_cfg.temperature,
-            top_p=self._base_cfg.top_p,
-            response_mime_type=self._base_cfg.response_mime_type,
-            response_schema=self._base_cfg.response_schema,
-            max_output_tokens=max_tokens,
-        )
+
+        messages=[
+            {"role": "system", "content": self.system_instruction},
+            {"role": "user", "content": user_prompt}
+        ]
 
         # Single request generation with fallbacks
         def _call_structured():
-            return self.model.generate_content(
-                user_prompt,
-                generation_config=cfg,
-                request_options={"timeout": timeout_s},
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=max_tokens,
+                reasoning_effort="medium"
             )
-        
-        result = self._with_retries(_call_structured, max_retries=max_retries)
-        raw = self._extract_json_text(result)
+            return response.choices[0].message.content
+
+        raw = self._with_retries(_call_structured, max_retries=max_retries)
 
         if DEBUG_QG:
             print("=== RAW RESPONSE ===")
@@ -178,13 +171,6 @@ class EngineeringQuestionGen:
 
         data = self._safe_parse_json(raw)
 
-        # Fallback if structured generation fails
-        if not data.get("questions") or len(data.get("questions", [])) == 0:
-            if DEBUG_QG:
-                print("Structured generation failed. Using fallback...")
-            data = self._fallback_generation(
-                user_prompt, timeout_s, max_tokens, max_retries
-            )
 
         data = self._validate_and_enhance_engineering_content(
             data, course_code, course_name, topic, difficulty, 
@@ -194,68 +180,6 @@ class EngineeringQuestionGen:
         self._cache[payload_key] = data
         return data
 
-    async def generate_questions_async(
-        self,
-        course_code: str,
-        course_name: str,
-        topic: str,
-        difficulty: str,
-        num_questions: int,
-        max_retries: int = 3,
-        timeout_s: float = 90.0,
-        ensure_calc_ratio: float = 0.6,
-        engineering_focus: bool = True,
-    ) -> Dict[str, Any]:
-        payload_key = _hash_key(
-            course_code, course_name, topic, difficulty, 
-            str(num_questions), str(engineering_focus), self.model_name
-        )
-        
-        if payload_key in self._cache:
-            return self._cache[payload_key]
-
-        user_prompt = self._build_engineering_prompt(
-            course_code, course_name, topic, difficulty, 
-            num_questions, ensure_calc_ratio, engineering_focus
-        )
-        
-        max_tokens = min(8192, 350 + int(300 * max(1, num_questions)))
-        cfg = GenerationConfig(
-            temperature=self._base_cfg.temperature,
-            top_p=self._base_cfg.top_p,
-            response_mime_type=self._base_cfg.response_mime_type,
-            response_schema=self._base_cfg.response_schema,
-            max_output_tokens=max_tokens,
-        )
-
-        async def _coro_structured():
-            return await self.model.generate_content_async(
-                user_prompt,
-                generation_config=cfg,
-                request_options={"timeout": timeout_s},
-            )
-        
-        result = await self._with_retries_async(_coro_structured, max_retries=max_retries)
-        raw = self._extract_json_text(result)
-
-        if DEBUG_QG:
-            print("=== RAW ASYNC RESPONSE ===")
-            print(raw)
-
-        data = self._safe_parse_json(raw)
-
-        if not data.get("questions") or len(data.get("questions", [])) == 0:
-            data = await self._fallback_generation_async(
-                user_prompt, timeout_s, max_tokens, max_retries
-            )
-
-        data = self._validate_and_enhance_engineering_content(
-            data, course_code, course_name, topic, difficulty, 
-            num_questions, ensure_calc_ratio, engineering_focus
-        )
-        
-        self._cache[payload_key] = data
-        return data
 
     # ----------------------------- Internal Methods -----------------------------
     @staticmethod
@@ -331,34 +255,10 @@ class EngineeringQuestionGen:
             f"- Reference industry standards and practices\n"
             f"- Include real-world engineering applications\n"
             f"{focus_directive}\n\n"
-            f"Ensure all questions are directly relevant to {topic} in the context of {course_name}."
+            f"Ensure all questions are directly relevant to {topic} in the context of {course_name}.\n"
+            f"IMPORTANT: The output must be a single valid JSON object and nothing else."
         )
 
-    @staticmethod
-    def _extract_json_text(result) -> str:
-        """Extract JSON text from Gemini response with robust fallbacks."""
-        # Primary method
-        txt = getattr(result, "text", None)
-        if isinstance(txt, str) and txt.strip():
-            return txt
-
-        # Fallback to candidates
-        try:
-            candidates = getattr(result, "candidates", [])
-            if candidates:
-                for candidate in candidates:
-                    content = getattr(candidate, "content", None)
-                    if content:
-                        parts = getattr(content, "parts", [])
-                        for part in parts:
-                            part_text = getattr(part, "text", None)
-                            if isinstance(part_text, str) and part_text.strip():
-                                return part_text
-        except Exception as e:
-            if DEBUG_QG:
-                print(f"Error extracting from candidates: {e}")
-        
-        return ""
 
     @staticmethod
     def _safe_parse_json(s: str) -> Dict[str, Any]:
@@ -576,73 +476,6 @@ class EngineeringQuestionGen:
         
         return question
 
-    def _fallback_generation(self, user_prompt: str, timeout_s: float, max_tokens: int, max_retries: int) -> Dict[str, Any]:
-        """Fallback generation without schema constraints."""
-        cfg = GenerationConfig(
-            temperature=self._base_cfg.temperature + 0.1,  # Slightly higher for creativity
-            top_p=self._base_cfg.top_p,
-            max_output_tokens=max_tokens,
-        )
-        
-        fallback_prompt = (
-            user_prompt + 
-            "\n\nIMPORTANT: Return ONLY a valid JSON object with a 'questions' array. "
-            "Each question must have all required fields. Use proper LaTeX formatting. "
-            "No markdown code blocks, no additional text."
-        )
-
-        def _call_fallback():
-            return self.model.generate_content(
-                fallback_prompt,
-                generation_config=cfg,
-                request_options={"timeout": timeout_s},
-            )
-
-        try:
-            result = self._with_retries(_call_fallback, max_retries=max_retries)
-            raw = self._extract_json_text(result)
-            if DEBUG_QG:
-                print("=== FALLBACK RESPONSE ===")
-                print(raw)
-            return self._safe_parse_json(raw)
-        except Exception as e:
-            if DEBUG_QG:
-                print(f"Fallback generation failed: {e}")
-            return {"questions": []}
-
-    async def _fallback_generation_async(self, user_prompt: str, timeout_s: float, max_tokens: int, max_retries: int) -> Dict[str, Any]:
-        """Async fallback generation without schema constraints."""
-        cfg = GenerationConfig(
-            temperature=self._base_cfg.temperature + 0.1,
-            top_p=self._base_cfg.top_p,
-            max_output_tokens=max_tokens,
-        )
-        
-        fallback_prompt = (
-            user_prompt + 
-            "\n\nIMPORTANT: Return ONLY a valid JSON object with a 'questions' array. "
-            "Each question must have all required fields. Use proper LaTeX formatting. "
-            "No markdown code blocks, no additional text."
-        )
-
-        async def _coro_fallback():
-            return await self.model.generate_content_async(
-                fallback_prompt,
-                generation_config=cfg,
-                request_options={"timeout": timeout_s},
-            )
-
-        try:
-            result = await self._with_retries_async(_coro_fallback, max_retries=max_retries)
-            raw = self._extract_json_text(result)
-            if DEBUG_QG:
-                print("=== ASYNC FALLBACK RESPONSE ===")
-                print(raw)
-            return self._safe_parse_json(raw)
-        except Exception as e:
-            if DEBUG_QG:
-                print(f"Async fallback generation failed: {e}")
-            return {"questions": []}
 
     # --------------------------- Retry helpers ---------------------------
     @staticmethod
